@@ -6,7 +6,9 @@ use Drupal\Core\Cache\CacheableMetadata;
 use Drupal\Core\Cache\CacheableResponse;
 use Drupal\Core\Form\FormStateInterface;
 use Drupal\rest\Plugin\views\display\RestExport;
+use Drupal\views\Plugin\views\display\DefaultDisplay;
 use Drupal\views\ViewExecutable;
+use Drupal\views\Views;
 
 /**
  * Provides a data export display plugin.
@@ -33,6 +35,28 @@ class DataExport extends RestExport {
   public static function buildResponse($view_id, $display_id, array $args = []) {
     // Do not call the parent method, as it makes the response harder to alter.
     // @see https://www.drupal.org/node/2779807
+
+    // Get the executable view.
+    $view = Views::getView($view_id);
+    $formats = $view->storage->getDisplay($display_id)['display_options']['style']['options']['formats'];
+    // Use batch for CSV mode only.
+    // @todo: Move the batch call?
+    if (in_array('csv', $formats)) {
+      // Get the current display.
+      $display = $view->getDisplay($display_id);
+      // Number of items to process per batch.
+      // @todo: Get default number of items.
+      $items_per_batch = 50;
+      // Create a batch definition.
+      $batch_definition = [
+        'operations' => [
+          [__CLASS__, 'process'], [$view, $display, $items_per_batch],
+        ],
+        'finished' => [__CLASS__, 'finish'],
+      ];
+      batch_set($batch_definition);
+    }
+
     $build = static::buildBasicRenderable($view_id, $display_id, $args);
 
     // Setup an empty response, so for example, the Content-Disposition header
@@ -215,6 +239,76 @@ class DataExport extends RestExport {
       case 'path':
         $this->setOption('filename', $form_state->getValue('filename'));
         break;
+    }
+  }
+
+  /**
+   * Processes the export operation.
+   *
+   * @param \Drupal\views\ViewExecutable $view
+   *   The executable view.
+   * @param \Drupal\views\Plugin\views\display\DefaultDisplay $display
+   *   Data export display.
+   * @param int $items
+   *   The number of items to load per batch process.
+   * @param mixed &$context
+   *   The current batch context.
+   */
+  public static function process(ViewExecutable $view, DefaultDisplay $display, $items, &$context) {
+    if (empty($context['sandbox'])) {
+      $context['sandbox']['progress'] = 0;
+      $context['sandbox']['items'] = $items;
+      $context['sandbox']['offset'] = (int) $view->getOffset();
+      // @todo: Use the views query.
+      $context['sandbox']['max'] = (int) db_query('SELECT COUNT(uid) FROM users')->fetchField() - 1;
+
+      // Create a CSV file.
+      $filename = $view->id() . '_' . $display->getBaseId() . '_export.csv';
+      $file_path = file_directory_temp() . '/' . $filename;
+      $csv_file = fopen($file_path, 'w');
+      $field_labels = ['uid'];
+      // @todo: Use getFieldLabels().
+      // $field_labels = array_keys($display->getFieldLabels());
+      // Add headers/file names into the file.
+      fputcsv($csv_file, $field_labels);
+      fclose($csv_file);
+
+      $context['sandbox']['file'] = $file_path;
+      $context['sandbox']['fields'] = $field_labels;
+    }
+
+    // Load items in chunks.
+    $view->setItemsPerPage($context['sandbox']['items']);
+    $view->setOffset($context['sandbox']['offset']);
+    $view->execute();
+
+    // Update the new offset value.
+    $context['sandbox']['offset'] += $context['sandbox']['items'];
+
+    // Open the CSV file.
+    $csv_file = fopen($context['sandbox']['file'], 'a');
+
+    foreach ($view->result as $row) {
+      // @todo: Add the row values.
+      fputcsv($csv_file, [$row->uid]);
+      $context['results'][] = $row->uid . ' : user';
+      $context['sandbox']['progress']++;
+    }
+    if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+      $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+    }
+
+    // Close the file.
+    fclose($csv_file);
+  }
+
+  /**
+   * Finishes the export batch.
+   */
+  public static function finish($success, $results, $operations) {
+    // Check if the batch job was successful.
+    if ($success) {
+      drupal_set_message(t('%count items exported.', ['%count' => count($results)]));
     }
   }
 
